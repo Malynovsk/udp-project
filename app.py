@@ -1,175 +1,145 @@
-from flask import Flask, render_template, url_for, request, redirect, session, sessions, jsonify
-import base as db
-from datetime import datetime
+import asyncio
+from functools import wraps
+from inspect import iscoroutinefunction
+import os
+from flask.app import *
+from flask.app import Flask as OriginalFlask
+from flask import cli
+from flask.globals import _app_ctx_stack, _request_ctx_stack
+from flask.helpers import get_debug_flag, get_env, get_load_dotenv
+from greenletio import await_
+import uvicorn
+from .asgi import WsgiToAsgiInstance
+from .cli import show_server_banner, AppGroup
+from .ctx import AppContext, RequestContext
+from .testing import FlaskClient, FlaskCliRunner
 
-application = Flask(__name__)
-application.config['SECRET_KEY'] = 'jkguishgUIHUIHiughduihsUIGHiughSIDGHUs'
-domain = 'http://udp-express.com'
-import aiosqlite
 
-async def conn():
-    return await aiosqlite.connect('./base.db')
+class Flask(OriginalFlask):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cli = AppGroup()
+        self.jinja_options['enable_async'] = True
+        self.test_client_class = FlaskClient
+        self.test_cli_runner_class = FlaskCliRunner
+        self.async_fixed = False
 
+    def ensure_sync(self, func):
+        if not iscoroutinefunction(func):
+            return func
 
-@application.context_processor
-def handle_context():
-    return dict(
-        datetime = datetime,
-        day = 18,
-        month = 2,
-        year = 2023,
+        def wrapped(*args, **kwargs):
+            appctx = _app_ctx_stack.top
+            reqctx = _request_ctx_stack.top
+
+            async def _coro():
+                # app context is push internally to avoid changing reference
+                # counts and emitting duplicate signals
+                _app_ctx_stack.push(appctx)
+                if reqctx:
+                    _request_ctx_stack.push(reqctx)
+                ret = await func(*args, **kwargs)
+                if reqctx:
+                    _request_ctx_stack.pop()
+                _app_ctx_stack.pop()
+                return ret
+
+            return await_(_coro())
+
+        return wrapped
+
+    def app_context(self):
+        return AppContext(self)
+
+    def request_context(self, environ):
+        return RequestContext(self, environ)
+
+    def _fix_async(self):  # pragma: no cover
+        self.async_fixed = True
+
+        if os.environ.get('AIOFLASK_USE_DEBUGGER') == 'true':
+            os.environ['WERKZEUG_RUN_MAIN'] = 'true'
+            from werkzeug.debug import DebuggedApplication
+            self.wsgi_app = DebuggedApplication(self.wsgi_app, evalex=True)
+
+    async def asgi_app(self, scope, receive, send):  # pragma: no cover
+        if not self.async_fixed:
+            self._fix_async()
+        return await WsgiToAsgiInstance(self.wsgi_app)(scope, receive, send)
+
+    async def __call__(self, scope, receive, send=None):  # pragma: no cover
+        if send is None:
+            # we were called with two arguments, so this is likely a WSGI app
+            raise RuntimeError('The WSGI interface is not supported by '
+                               'aioflask, use an ASGI web server instead.')
+        return await self.asgi_app(scope, receive, send)
+
+    def run(self, host=None, port=None, debug=None, load_dotenv=True,
+            **options):
+
+        if get_load_dotenv(load_dotenv):
+            cli.load_dotenv()
+
+            # if set, let env vars override previous values
+            if "FLASK_ENV" in os.environ:
+                self.env = get_env()
+                self.debug = get_debug_flag()
+            elif "FLASK_DEBUG" in os.environ:
+                self.debug = get_debug_flag()
+
+        # debug passed to method overrides all other sources
+        if debug is not None:
+            self.debug = bool(debug)
+
+        server_name = self.config.get("SERVER_NAME")
+        sn_host = sn_port = None
+
+        if server_name:
+            sn_host, _, sn_port = server_name.partition(":")
+
+        if not host:
+            if sn_host:
+                host = sn_host
+            else:
+                host = "127.0.0.1"
+
+        if port or port == 0:
+            port = int(port)
+        elif sn_port:
+            port = int(sn_port)
+        else:
+            port = 5000
+
+        options.setdefault("use_reloader", self.debug)
+        options.setdefault("use_debugger", self.debug)
+        options.setdefault("threaded", True)
+        options.setdefault("workers", 1)
+
+        certfile = None
+        keyfile = None
+        cert = options.get('ssl_context')
+        if cert is not None and len(cert) == 2:
+            certfile = cert[0]
+            keyfile = cert[1]
+        elif cert == 'adhoc':
+            raise RuntimeError(
+                'Aad-hoc certificates are not supported by aioflask.')
+
+        if debug:
+            os.environ['FLASK_DEBUG'] = 'true'
+
+        if options['use_debugger']:
+            os.environ['AIOFLASK_USE_DEBUGGER'] = 'true'
+
+        show_server_banner(self.env, self.debug, self.name, False)
+
+        uvicorn.run(
+            self.import_name + ':app',
+            host=host,
+            port=port,
+            reload=options['use_reloader'],
+            workers=options['workers'],
+            log_level='debug' if self.debug else 'info',
+            ssl_certfile=certfile,
+            ssl_keyfile=keyfile,
         )
-
-@application.route('/')
-async def index():
-    return render_template('/index.html')
-
-@application.route('/about')
-async def about():
-    return render_template('/aboutus.html')
-
-@application.route('/contacts')
-async def contacts():
-    return render_template('/contact.html')
-
-@application.route('/logistics')
-async def logistics():
-    return render_template('/logistics.html')
-
-@application.route('/services')
-async def services():
-    return render_template('services.html')
-
-@application.route('/roter/<string:to>')
-async def router(to):
-    if str(to) == str('index'):
-        return redirect(domain + '/')
-    if str(to) == str('services'):
-        return redirect(domain + '/services')
-    if str(to) == str('logistics'):
-        return redirect(domain + '/logistics')
-    if str(to) == str('contacts'):
-        return redirect(domain + '/contacts')
-    if str(to) == str('about'):
-        return redirect(domain + '/about')
-    
-
-@application.route('/admin', methods = ['POST', 'GET'])
-async def admin():
-    if request.method == 'GET':
-        return render_template('/admin/login.html')
-    else:
-        login = request.form['a-username']
-        password = request.form['a-password']
-        res = await db.check_admin(login=login, password = password)
-        if res == True:
-            session_key = await db.add_session(login = login)
-            session['session'] = session_key
-            return redirect(str(domain) + '/apanel')
-        elif res == False:
-            return 'Неверный пароль!'
-        else:
-            return 'Аккаунта с таким логином не существует!'
-
-
-@application.route('/apanel')
-async def apanel():
-    if await db.check_session(session=session.get('session')) == True:
-        return render_template('admin/panel.html')
-    else:
-        return redirect(domain + "/admin")
-
-@application.route('/createtrack', methods=["GET", "POST"])
-async def createtrack():
-    if request.method == 'GET':
-        if await db.check_session(session=session.get('session')) == True:
-            return render_template('admin/create_track.html', day = int(18), year = int(2023), month = int(2))
-        else:
-            return redirect(domain + '/admin')
-    if request.method == 'POST':
-        if await db.check_session(session=session.get('session')) == True:
-            op = 0
-            res = await db.new_track(track = request.form['track_number'], sender = request.form['sender'], recipient=request.form['recipient'], weight=request.form['weight'])
-            if res != 'Not':
-                for i in range(40):
-                    get_date = request.form[f'dates[{op}]'].replace(' ', ',')
-                    await db.updateStatusTrack(track=request.form['track_number'], status_number=str(op), status = f"{get_date}|{request.form[f'names[{op}]']}")
-                    op += 1
-                return "Yes"
-            else:
-                return "Такой трек-номер уже существует!"
-            
-        else:
-            return 'None'
-
-@application.route('/search', methods=['POST', 'GET'])
-async def search():
-    if request.method == "GET":
-        return render_template('/search.html', data = 'Stop')
-    if request.method == 'POST':
-        res = await db.track_check(track = str(request.form['track']))
-        if res != False:
-            resstatues = await db.getStatuses(track = str(request.form['track']))
-            if resstatues != False:
-                return render_template('/search.html', data = res, ss=resstatues, datetime=datetime)
-            else:
-                return render_template('/search.html', data = 'None')
-        else:
-            return render_template('/search.html', data = 'None')
-
-@application.route('/orders', methods=['POST', "GET"])
-async def orders():
-    if request.method == 'GET':
-        orders = await db.getOrders()
-        if await db.check_session(session=session.get('session')) == True:
-            return render_template('./admin/track_list.html', orders=orders)
-
-@application.route('/srch/<string:track>')
-async def srch(track):
-    res = await db.track_check(track =track)
-    resstatues = await db.getStatuses(track = track)
-    return render_template('./search.html', data = res, ss = resstatues, datetime=datetime)
-
-@application.route('/editTrack/<string:track>', methods=['POST', 'GET'])
-async def editTrack(track):
-    if request.method == 'GET':
-        info = await db.get_track(track = track)
-        statuses = await db.getStatuses(track = track)
-        return render_template('./admin/edit.html',info = info ,track = str(track), stat = statuses)
-    if request.method == 'POST':
-        data = {
-            'sender': request.form['sender'],
-            'recipient': request.form['recipient'],
-            'weight': request.form['weight'],
-            'track': request.form['track_number']
-        }
-        op = 0  
-        for i in range(40):
-            await db.updateStatusTrack(track=track, status_number=op, status = F"{request.form[f'dates[{op}]'].replace(' ', ',')} | {request.form[f'names[{op}]']}")
-            op += 1
-        await db.newStatusTrack(old_track=track, track=data['track'])
-        await db.changeTrack(track = track, sender=data['sender'], recipient=data['recipient'], weight=data['weight'], track_number=data['track'])
-        return redirect(str(domain) + "/orders")
-
-@application.route('/deleteTrack/<string:track>')
-async def deleteTrack(track):
-    try:
-        db = await conn()
-        sql = await db.cursor()
-        await sql.execute("DELETE FROM tracks WHERE track = ?", (track,))
-        await db.commit()
-        await db.close()
-        return("Yes")
-    except:
-        return("error")
-
-@application.route('/logout')
-async def logout():
-    res = await db.logout(session=session.get('session'))
-    if str(res) == 'yes':
-        return redirect(domain + '/')
-    else:
-        return str(res)
-
-if __name__ == "__main__":
-    application.run(debug=True, host='127.0.0.1')

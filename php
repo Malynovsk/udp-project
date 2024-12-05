@@ -1,0 +1,1 @@
+#!/opt/php/8.0/bin/php-cgi

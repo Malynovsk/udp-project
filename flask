@@ -1,0 +1,31 @@
+#!/var/www/u1947297/data/flaskenv/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from flask.cli import main # type: ignore
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())
+from datetime import datetime
+from flask import Flask, render_template # type: ignore
+
+app = Flask(__name__)
+
+# Приклад даних (заміни на реальні дані з бази даних або іншого джерела)
+orders = [
+    {'id': 1, 'sender': 'Отправитель 1', 'receiver': 'Получатель 1', 'weight': 5, 'created_at': datetime(2024, 12, 5, 10, 0)},
+    {'id': 2, 'sender': 'Отправитель 2', 'receiver': 'Получатель 2', 'weight': 3, 'created_at': datetime(2024, 12, 5, 11, 0)},
+    {'id': 3, 'sender': 'Отправитель 3', 'receiver': 'Получатель 3', 'weight': 7, 'created_at': datetime(2024, 12, 6, 9, 0)},
+]
+
+@app.route('/tracks')
+def show_tracks():
+    now = datetime.now()
+
+    # Фільтруємо треки, щоб показувати тільки ті, що створені до поточної дати
+    filtered_tracks = [track for track in orders if track['created_at'] <= now]
+
+    return render_template('tracks.html', orders=filtered_tracks)
+
+if __name__ == '__main__':
+    app.run(debug=True)
